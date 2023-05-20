@@ -1,0 +1,1656 @@
+---
+title: "No trade-off between seed persistence and seedling emergence: the role of regeneration traits via a long-term experiment"
+author: "Si-Chong Chen"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_depth: 2
+    toc_float:
+      collapsed: false
+      smooth_scroll: false
+    number_sections: true
+    theme: paper
+---
+
+```{r global-options, include = FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE, tidy = TRUE,
+                      fig.width = 8, fig.height = 6, fig.align = "center")
+```
+
+
+<style type="text/css">
+
+body{ /* Normal  */
+      font-size: 16px;
+      font-family: "Arial"
+  }
+td {  /* Table  */
+  font-size: 14px;
+}
+h1.title {
+  font-size: 34px;
+  color: Black;
+  font-family: "Arial";
+}
+h1 { /* Header 1 */
+  font-size: 26px;
+  color: DarkBlue;
+  font-family: "Arial";
+}
+h2 { /* Header 2 */
+    font-size: 22px;
+    font-family: "Arial";
+    color: DarkBlue;
+}
+h3 { /* Header 3 */
+  font-size: 18px;
+  font-family: "Arial";
+  color: DarkBlue;
+}
+
+h4 { /* Header 4 */
+  font-size: 16px;
+  font-family: "Arial";
+  color: DarkBlue;
+}
+code.r{ /* Code block */
+    font-size: 16px;
+}
+pre { /* Code block - determines code spacing between lines */
+    font-size: 16px;
+}
+</style>
+
+
+<br>
+
+> **Variables and abbreviations**:\
+
+**P**: Persistence\
+**E**: Emergence\
+**D**: Dormancy type (ND, MPD, PD, PY)\
+**LS**: Adult lifespan (Annual, Perennial)\
+**MP**: Reproductive frequency (Monocarpic, Polycarpic)\
+**SM**: Seed mass\
+
+**species_TPL**: Identitiy of species (non-phylogenetic part)\
+**species_TPL_phylo**: Identitiy of species (phylogenetic part)\
+
+<br>
+
+
+# Setup
+## Load packages
+```{r setup}
+library(tidyverse)
+library(readxl)
+library(lubridate)
+library(boot)
+library(cowplot)
+library(scales)
+
+library(brms)
+library(bayesplot)
+library(tidybayes)
+library(performance)
+
+set.seed(123)
+
+# These options help Stan run faster:
+library(rstan)
+options(mc.cores = parallel::detectCores())
+rstan_options(auto_write = TRUE)
+
+# Note: The version of RStan currently available on CRAN is not compatible with R4.2
+# https://github.com/stan-dev/rstan/wiki/Configuring-C---Toolchain-for-Windows#r-42
+# Run the code:
+# install.packages("StanHeaders", repos = c("https://mc-stan.org/r-packages/", getOption("repos")))
+# install.packages("rstan", repos = c("https://mc-stan.org/r-packages/", getOption("repos")))
+```
+
+<br>
+
+## Functions
+```{r}
+# Ftable
+library(kableExtra)
+Ftable <- function(model, reorder = F, order){
+  table = summary(model, prob = 0.95)$fixed
+  table2 = summary(model, prob = 0.90)$fixed %>% as_tibble()
+  names = rownames(table)
+  table = table %>% 
+    as_tibble() %>% 
+    rename("L95%CL" = `l-95% CI`, "U95%CL" = `u-95% CI`) %>% 
+    select(-Rhat, -Bulk_ESS, -Tail_ESS)
+  table$`L90%CL` = table2$`l-90% CI`
+  table$`U90%CL` = table2$`u-90% CI`
+  
+  table = table %>% 
+    mutate(Estimate = ifelse(`L95%CL` * `U95%CL` > 0, 
+                             paste(sprintf("%.3f", round(Estimate, 3)), "**", sep = ""), 
+                             ifelse(`L90%CL` * `U90%CL` > 0, 
+                                    paste(sprintf("%.3f", round(Estimate, 3)), "*", sep = ""), round(Estimate, 3))),
+           rowname = names) %>% 
+    rename("SE" = Est.Error)  %>% 
+    column_to_rownames(var = "rowname") 
+  
+  if (reorder == T){
+    table = table[order,]
+  }
+  
+  table = table %>% 
+    kable(digits = 3, escape = F, table.attr = "style = \"color: black;\"") %>% 
+    kable_styling(position = "center")
+  return(table)
+}
+
+
+#geom_flat_violin
+library(grid)
+geom_flat_violin <- function(mapping = NULL, data = NULL, stat = "ydensity",
+                             position = "dodge", trim = TRUE, scale = "area",
+                             show.legend = NA, inherit.aes = TRUE, ...) {
+  layer(
+    data = data,
+    mapping = mapping,
+    stat = stat,
+    geom = GeomFlatViolin,
+    position = position,
+    show.legend = show.legend,
+    inherit.aes = inherit.aes,
+    params = list(
+      trim = trim,
+      scale = scale,
+      ...
+    )
+  )
+}
+
+"%||%" <- function(a, b) {
+  if (!is.null(a)) a else b
+}
+
+GeomFlatViolin <-
+  ggproto("GeomFlatViolin", Geom,
+          setup_data = function(data, params) {
+            data$width <- data$width %||%
+              params$width %||% (resolution(data$x, FALSE) * 0.9)
+            
+            # ymin, ymax, xmin, and xmax define the bounding rectangle for each group
+            data %>%
+              group_by(group) %>%
+              mutate(ymin = min(y),
+                     ymax = max(y),
+                     xmin = x,
+                     xmax = x + width / 2)
+          },
+          
+          draw_group = function(data, panel_scales, coord) {
+            # Find the points for the line to go all the way around
+            data <- transform(data, xminv = x,
+                              xmaxv = x + violinwidth * (xmax - x))
+            newdata <- rbind(plyr::arrange(transform(data, x = xmaxv), -y),plyr::arrange(transform(data, x = xminv), y))
+            newdata_Polygon <- rbind(newdata, newdata[1,])
+            newdata_Polygon$colour <- NA
+            newdata_Path <- plyr::arrange(transform(data, x = xmaxv), -y)
+            
+            ggplot2:::ggname("geom_flat_violin", grobTree(
+              GeomPolygon$draw_panel(newdata_Polygon, panel_scales, coord),
+              GeomPath$draw_panel(newdata_Path, panel_scales, coord)))
+          },
+          
+          draw_key = draw_key_polygon,
+          
+          default_aes = aes(weight = 1, colour = "grey20", fill = "white", size = 0.5,
+                            alpha = NA, linetype = "solid"),
+          
+          required_aes = c("x", "y")
+  )
+```
+
+<br>
+
+## Palette
+Use this palette: `show_col(brewer_pal(palette = "Set2")(3))`
+```{r}
+GREEN = "#66C2A5"
+ORANGE = "#FC8D62"
+BLUE = "#8DA0CB"
+```
+
+<br>
+
+
+# Data
+## Load data
+```{r}
+data = read_excel("data analysis.xlsx", sheet = "Final", na = "NA")
+
+data = data %>% 
+  # Create times and persistence
+  mutate(sowing_date = make_date(sowing_year, sowing_month, sowing_day),
+         ending_date = make_date(ending_year, ending_month, ending_day),
+         Persistence = as.numeric(difftime(ending_date, sowing_date, units = "days"))) %>% 
+  # Define data type and level order
+  mutate(Dormancy = factor(Dormancy, levels = c("ND", "MPD", "PD", "PY")),
+         LS = factor(LS, levels = c("Annual", "Perennial")),
+         MP = factor(MP, levels = c("Monocarpic", "Polycarpic"))) %>% 
+  # Data transformation
+  mutate(Emergence = Emergence / 100,
+         Emergence.logit = logit(Emergence),
+         Persistence.log = log10(Persistence),
+         SM.log = log10(SM)) %>% 
+  mutate(Total = ifelse(sowing_year < 1973, 400, 900))
+
+
+# "The variables phylo and species are identical as they are both identifiers of the species."
+data = mutate(data, species_TPL_phylo = species_TPL)
+```
+
+<br>
+
+## Prepare tree
+```{r eval = FALSE}
+species.list = data %>% 
+  distinct(species.list) %>% 
+  separate(col = species.list, into = c("family", "genus", "species"), sep = "/") %>% 
+  mutate(species = str_replace(species, "_", " ")) %>% 
+  relocate(species, genus, family) %>% 
+  as.data.frame()
+head(species.list)
+row.names(species.list) = sub(" ", "_", species.list$species)
+
+# devtools::install_github("jinyizju/V.PhyloMaker")
+library(V.PhyloMaker)
+tree.GBOTB <- phylo.maker(species.list, scenarios = "S1")
+tree <- tree.GBOTB$scenario.1
+str(tree)
+
+#-- Write tree
+library(ape)
+write.tree(tree, "tree_349.tre")
+```
+
+<br>
+
+## Load tree
+```{r}
+#-- Load tree
+library(ape)
+tree = read.tree("tree_349.tre")
+
+# A <- ape::vcv.phylo(tree)
+species_TPL_tree = keep.tip(tree, unique(as.character(data$species_TPL_phylo))) %>% vcv.phylo
+A = species_TPL_tree
+```
+
+<br>
+
+## Subset data
+```{r}
+# ND
+data_ND = filter(data, Dormancy == "ND")
+species_TPL_tree_ND = keep.tip(tree, unique(as.character(data_ND$species_TPL))) %>% vcv.phylo
+A_ND = species_TPL_tree_ND
+
+# MPD
+data_MPD = filter(data, Dormancy == "MPD")
+species_TPL_tree_MPD = keep.tip(tree, unique(as.character(data_MPD$species_TPL))) %>% vcv.phylo
+A_MPD = species_TPL_tree_MPD
+
+# PD
+data_PD = filter(data, Dormancy == "PD")
+species_TPL_tree_PD = keep.tip(tree, unique(as.character(data_PD$species_TPL))) %>% vcv.phylo
+A_PD = species_TPL_tree_PD
+
+# PY
+data_PY = filter(data, Dormancy == "PY")
+species_TPL_tree_PY = keep.tip(tree, unique(as.character(data_PY$species_TPL))) %>% vcv.phylo
+A_PY = species_TPL_tree_PY
+
+# Annual
+data_Annual = filter(data, LS == "Annual")
+species_TPL_tree_Annual = keep.tip(tree, unique(as.character(data_Annual$species_TPL))) %>% vcv.phylo
+A_Annual = species_TPL_tree_Annual
+
+# Perennial
+data_Perennial = filter(data, LS == "Perennial")
+species_TPL_tree_Perennial = keep.tip(tree, unique(as.character(data_Perennial$species_TPL))) %>% vcv.phylo
+A_Perennial = species_TPL_tree_Perennial
+
+# Monocarpic
+data_Monocarpic = filter(data, MP == "Monocarpic")
+species_TPL_tree_Monocarpic = keep.tip(tree, unique(as.character(data_Monocarpic$species_TPL))) %>% vcv.phylo
+A_Monocarpic = species_TPL_tree_Monocarpic
+
+# Polycarpic
+data_Polycarpic = filter(data, MP == "Polycarpic")
+species_TPL_tree_Polycarpic = keep.tip(tree, unique(as.character(data_Polycarpic$species_TPL))) %>% vcv.phylo
+A_Polycarpic = species_TPL_tree_Polycarpic
+```
+
+<br>
+
+
+# Visulise the phylogenetic tree and data
+## Figure 1
+```{r}
+data_2 = data %>% 
+  dplyr::select(species_TPL, species.list, Emergence.logit, Persistence.log, Dormancy) %>%
+  group_by(species_TPL, Dormancy) %>% 
+  summarise(Persistence.log = mean(Persistence.log),
+            Emergence.logit = mean(Emergence.logit)) %>% 
+  as.data.frame()
+row.names(data_2) = data_2$species_TPL
+# geiger:name.check(tree, data_2)
+
+# BiocManager::install("ggtree")
+library(ggtree)
+circ <- ggtree(tree, layout = "circular", size = 0.25)
+
+#-- WITHOUT tip labels
+p1 <- gheatmap(circ, data_2[, "Dormancy", drop = FALSE], colnames = FALSE, width = 0.1, offset = -5) +
+  scale_fill_manual(name = "Dormancy type", breaks = c("ND", "MPD", "PD", "PY"), values = scales::hue_pal()(4), guide = guide_legend(order = 1))    # Note here for multiple legends order
+
+library(ggnewscale)
+p2 <- p1 + new_scale_fill()
+
+p3 <- gheatmap(p2, data_2[, c("Persistence.log"), drop = FALSE], colnames = FALSE, width = 0.1, offset = 10) +
+  scale_fill_viridis_c(name = "Seed persistence\n(day) [log scale]", option = "viridis", direction = -1, breaks = c(2, 3, log10(5000)), labels = c("100", "1000", "5000"), na.value = NA)
+
+p4 <- p3 + new_scale_fill()
+
+p5 <- gheatmap(p4, data_2[, c("Emergence.logit"), drop = FALSE], colnames = FALSE, width = 0.1, offset = 25) +
+  scale_fill_viridis_c(name = "Seedling emergence\n[logit scale]", option = "plasma", direction = -1, breaks = c(logit(0.02), logit(0.12), logit(0.50), logit(0.88), logit(0.98), logit(0.999)), labels = c("0.02", "0.12", "0.50", "0.88", "0.98", "0.999"), na.value = NA)
+
+#-- Add family names (use geom_cladelabel or geom_strip)
+p5 +
+  geom_strip("Verbesina_virginica", "Eupatorium_altissimum", label="Asteraceae", barsize=1, fontsize=3, hjust=0.5, offset=45, offset.text=10, angle=65) +  #54 spp.
+  geom_strip("Lespedeza_capitata", "Desmanthus_illinoensis", label="Fabaceae", barsize=1, fontsize=3, hjust=0.5, offset=45, offset.text=10, angle=66) +  #31 spp.
+  geom_strip("Alyssum_alyssoides", "Paysonia_stonensis", label="Brassicaceae", barsize=1, fontsize=3, hjust=0.5, offset=45, offset.text=10, angle=16) +  #26 spp.
+  geom_strip("Panicum_capillare", "Diarrhena_americana", label="Poaceae", barsize=1, fontsize=3, hjust=0.5, offset=45, offset.text=10, angle=-48) + #23 spp.
+  geom_strip("Osmorhiza_aristata", "Sanicula_canadensis", label="Apiaceae", barsize=1, fontsize=3, hjust=0.5, offset=45, offset.text=10, angle=22) + #19 spp.
+  geom_strip("Leucospora_multifida", "Plantago_aristata", label="Plantaginaceae", barsize=1, fontsize=3, hjust=0.5, offset=45, offset.text=10, angle=-20) + #14 spp.
+  geom_strip("Monarda_fistulosa", "Synandra_hispidula", label="Lamiaceae", barsize=1, fontsize=3, hjust=0.5, offset=45, offset.text=10, angle=0) + #12 spp.
+  geom_strip("Sida_spinosa", "Anoda_cristata", label="Malvaceae", barsize=1, fontsize=3, hjust=0.5, offset=45, offset.text=10, angle=-2) + #11 spp.
+  geom_strip("Anemone_hepatica", "Hydrastis_canadensis", label="Ranunculaceae", barsize=1, fontsize=3, hjust=0.5, offset=45, offset.text=10, angle=-24) #11 spp.
+
+#-- Figure 1
+ggsave("Rmd/ggtree_without tip_family.jpg", width = 8, height = 8, units = "in", dpi = 300)
+ggsave("Rmd/ggtree_without tip_family.pdf", width = 8, height = 8)
+```
+
+<br>
+
+## Appendix S1
+```{r}
+#-- WITH tip labels
+circ.tip <- circ + geom_tiplab(aes(angle = angle), hjust = -0.05, size = 0.87)
+
+# (1) Use "circ.tip"
+# (2) Add additional 50 to all offset above
+p1 <- gheatmap(circ.tip, data_2[, "Dormancy", drop = FALSE], colnames = FALSE, width = 0.1, offset = 45) +
+  scale_fill_manual(name = "Dormancy type", breaks = c("ND", "MPD", "PD", "PY"), values = scales::hue_pal()(4), guide = guide_legend(order = 1))    # Note here for multiple legends order
+
+library(ggnewscale)
+p2 <- p1 + new_scale_fill()
+
+p3 <- gheatmap(p2, data_2[, c("Persistence.log"), drop = FALSE], colnames = FALSE, width = 0.1, offset = 60) +
+  scale_fill_viridis_c(name = "Seed persistence\n(day) [log scale]", option = "viridis", direction = -1, breaks = c(2, 3, log10(5000)), labels = c("100", "1000", "5000"), na.value = NA)
+
+p4 <- p3 + new_scale_fill()
+
+p5 <- gheatmap(p4, data_2[, c("Emergence.logit"), drop = FALSE], colnames = FALSE, width = 0.1, offset = 75) +
+  scale_fill_viridis_c(name = "Seedling emergence\n[logit scale]", option = "plasma", direction = -1, breaks = c(logit(0.02), logit(0.12), logit(0.50), logit(0.88), logit(0.98), logit(0.999)), labels = c("0.02", "0.12", "0.50", "0.88", "0.98", "0.999"), na.value = NA)
+
+#-- Add family names (use geom_cladelabel or geom_strip)
+p5 +
+  geom_strip("Verbesina_virginica", "Eupatorium_altissimum", label="Asteraceae", barsize=1, fontsize=3, hjust=0.5, offset=95, offset.text=10, angle=65) +  #54 spp.
+  geom_strip("Lespedeza_capitata", "Desmanthus_illinoensis", label="Fabaceae", barsize=1, fontsize=3, hjust=0.5, offset=95, offset.text=10, angle=66) +  #31 spp.
+  geom_strip("Alyssum_alyssoides", "Paysonia_stonensis", label="Brassicaceae", barsize=1, fontsize=3, hjust=0.5, offset=95, offset.text=10, angle=16) +  #26 spp.
+  geom_strip("Panicum_capillare", "Diarrhena_americana", label="Poaceae", barsize=1, fontsize=3, hjust=0.5, offset=95, offset.text=10, angle=-48) + #23 spp.
+  geom_strip("Osmorhiza_aristata", "Sanicula_canadensis", label="Apiaceae", barsize=1, fontsize=3, hjust=0.5, offset=95, offset.text=10, angle=22) + #19 spp.
+  geom_strip("Leucospora_multifida", "Plantago_aristata", label="Plantaginaceae", barsize=1, fontsize=3, hjust=0.5, offset=95, offset.text=10, angle=-20) + #14 spp.
+  geom_strip("Monarda_fistulosa", "Synandra_hispidula", label="Lamiaceae", barsize=1, fontsize=3, hjust=0.5, offset=95, offset.text=10, angle=0) + #12 spp.
+  geom_strip("Sida_spinosa", "Anoda_cristata", label="Malvaceae", barsize=1, fontsize=3, hjust=0.5, offset=95, offset.text=10, angle=-2) + #11 spp.
+  geom_strip("Anemone_hepatica", "Hydrastis_canadensis", label="Ranunculaceae", barsize=1, fontsize=3, hjust=0.5, offset=95, offset.text=10, angle=-24) #11 spp.
+
+#-- Appendix S1
+ggsave("Rmd/ggtree_with tip_family.pdf", width = 8, height = 8)
+```
+
+<br>
+
+
+# Persistence.log ~ Emergence.logit
+## Overall
+```{r}
+#-- Model
+bm_E_P <- brm(data = data, data2 = list(A = A), family = gaussian(), 
+              Emergence.logit ~ Persistence.log + 
+                (1|species_TPL) + (1|gr(species_TPL_phylo, cov = A)), 
+              control = list(adapt_delta = 0.99), iter = 5000, cores = 4, chains = 4)
+Ftable(bm_E_P)    # Not significant
+
+#-- Plot
+ce_E_P = conditional_effects(bm_E_P, prob = 0.95)
+
+plot_E_P_bm_raw = ggplot(data, aes(x = Persistence.log, y = Emergence.logit)) +
+  geom_point(shape = 19, size = 2, alpha = 0.5, col = "grey50") + 
+  geom_line(data = ce_E_P$Persistence.log, aes(x = Persistence.log, y = estimate__), linewidth = 1, linetype = 2) +
+  geom_ribbon(data = ce_E_P$Persistence.log, aes(ymin = lower__, ymax = upper__), fill = "grey50", alpha = 0.25) +
+  xlab("Seed persistence (day) [log scale]") + ylab("Seedling emergence [logit scale]") +
+  scale_x_continuous(breaks = c(2, 3, log10(8000)), labels = c("100", "1000", "8000")) +
+  scale_y_continuous(breaks = c(logit(0.05), logit(0.20), logit(0.50), logit(0.80), logit(0.95), logit(0.99), logit(0.999)),
+                     labels = c("0.05", "0.20", "0.50", "0.80", "0.95", "0.99", "0.999")) +
+  theme_classic(base_size = 16) +
+  theme(axis.text = element_text(colour = "black"), axis.text.y = element_text(hjust = 0.5, angle = 90))
+
+plot_E_P_bm_raw
+
+ggsave("Rmd/Emergence_Persistence_bm_raw.jpg", units = "in", width = 8, height = 6, dpi = 300)
+```
+
+<br>
+
+## Across group (Dormancy)
+```{r}
+#-- Additive
+bm_E_P_D <- brm(data = data, data2 = list(A = A), family = gaussian(), 
+                      Emergence.logit ~ Persistence.log + Dormancy + 
+                        (1|species_TPL) + (1|gr(species_TPL_phylo, cov = A)), 
+                      control = list(adapt_delta = 0.99), iter = 5000, cores = 4, chains = 4)
+Ftable(bm_E_P_D)
+
+#-- Interaction
+bm_E_P_D_inter <- brm(data = data, data2 = list(A = A), family = gaussian(), 
+                       Emergence.logit ~ Persistence.log + Dormancy + Persistence.log:Dormancy + 
+                         (1|species_TPL) + (1|gr(species_TPL_phylo, cov = A)), 
+                       control = list(adapt_delta = 0.99), iter = 5000, cores = 4, chains = 4)
+Ftable(bm_E_P_D_inter)  # All the interaction terms are non-significant
+
+#-- Model selection
+r2_bayes(bm_E_P); r2_bayes(bm_E_P_D); r2_bayes(bm_E_P_D_inter)
+loo(bm_E_P, bm_E_P_D)
+loo(bm_E_P, bm_E_P_D_inter)
+# This result indicates: 
+# The difference between dormancy groups in the E~P relationship is on the intercept (bm_E_P_D model), not on the slope (bm_E_P_D_inter model).
+
+
+#-- Additive
+# Any difference between two groups?
+# In the hypothesis() function, even if we have continuous term (e.g. Persistence.log) and interaction term (e.g. Persistence.log:DormancyPY), no need to include them in the hypothesis() for multiple comparison (because we compare intercepts). Whether slopes are difference can be known from the interaction term in the model.
+h_test <- hypothesis(bm_E_P_D,
+                     hypothesis = c("Intercept = DormancyMPD + Intercept",
+                                    "Intercept = DormancyPD + Intercept", 
+                                    "Intercept = DormancyPY + Intercept", 
+                                    "DormancyMPD + Intercept = DormancyPD + Intercept", 
+                                    "DormancyMPD + Intercept = DormancyPY + Intercept", 
+                                    "DormancyPD + Intercept = DormancyPY + Intercept"))
+
+mcmc_intervals(h_test$samples, pars = c("H1", "H2", "H3", "H4", "H5", "H6"), prob = 0.90, prob_outer = 0.95, point_est = "mean", point_size = 6) +
+  xlab("Estimate") +
+  scale_y_discrete(breaks = c("H1", "H2", "H3", "H4", "H5", "H6"),
+                   labels = c("ND - MPD", "ND - PD", "ND - PY", "MPD - PD", "MPD - PY", "PD - PY"),
+                   limits = rev) +
+  theme_classic(base_size = 16) +
+  theme(axis.text = element_text(colour = "black"))
+ggsave("Emergence_Persistence_Dormancy_hypothesis.jpg", units = "in", width = 8, height = 6, dpi = 300)
+
+# For Interaction
+# Do slopes differ from 0?
+h_test <- hypothesis(bm_E_P_D_inter,
+                     hypothesis = c("Persistence.log  = 0",
+                                    "Persistence.log + Persistence.log:DormancyMPD  = 0", 
+                                    "Persistence.log + Persistence.log:DormancyPD  = 0", 
+                                    "Persistence.log + Persistence.log:DormancyPY  = 0"))
+
+mcmc_intervals(h_test$samples, pars = c("H1", "H2", "H3", "H4"), prob = 0.90, prob_outer = 0.95, point_est = "mean", point_size = 6) +
+  xlab("Estimate") +
+  scale_y_discrete(breaks = c("H1", "H2", "H3", "H4"),
+                   labels = c("ND slope", "MPD slope", "PD slope", "PY slope"),
+                   limits = rev) +
+  theme_classic(base_size = 16) +
+  theme(axis.text = element_text(colour = "black"))
+ggsave("Emergence_Persistence_Dormancy_inter_hypothesis.jpg", units = "in", width = 8, height = 6, dpi = 300)
+# This result also indicate:
+# The E~P slopes across Dormancy groups are all non-significant from 0, so they are similar with each other.
+
+# Plot the E~P slopes in each group
+ce = conditional_effects(bm_E_P_D_inter, prob = 0.95)
+plot_E_P_D_inter_bm = ggplot(data = ce$`Persistence.log:Dormancy`, aes(x = Persistence.log, y = estimate__)) +
+  geom_line(aes(col = Dormancy), linetype = 2, linewidth = 1) +
+  geom_ribbon(aes(ymin = lower__, ymax = upper__, fill = Dormancy), alpha = 0.25) +
+  xlab("Seed persistence (day) [log scale]") + ylab("Seedling emergence [logit scale]") +
+  scale_x_continuous(breaks = c(2, 3, log10(8000)), labels = c("100", "1000", "8000")) +
+  scale_y_continuous(breaks = c(logit(0.05), logit(0.20), logit(0.50), logit(0.80), logit(0.95), logit(0.99), logit(0.999)),
+                     labels = c("0.05", "0.20", "0.50", "0.80", "0.95", "0.99", "0.999")) +
+  theme_classic(base_size = 16) +
+  theme(axis.text = element_text(colour = "black"), axis.text.y = element_text(hjust = 0.5, angle = 90)) +
+  theme(legend.position = c("0.11", "0.85"))
+
+plot_E_P_D_inter_bm
+ggsave("Emergence_Persistence_Dormancy_inter_bm.jpg", units = "in", width = 8, height = 6, dpi = 300)
+```
+
+<br>
+
+## Within group (Dormancy)
+* ND
+```{r}
+#-- Model
+bm_E_P_ND <- brm(data = data_ND, data2 = list(A = A_ND), family = gaussian(), 
+                 Emergence.logit ~ Persistence.log + 
+                   (1|species_TPL) + (1|gr(species_TPL_phylo, cov = A)), 
+                 control = list(adapt_delta = 0.99), iter = 5000, cores = 4, chains = 4)
+Ftable(bm_E_P_ND)    # Not significant
+
+#-- Plot
+ce_E_P_ND = conditional_effects(bm_E_P_ND, prob = 0.95)
+
+plot_E_P_ND_bm_raw = ggplot(data_ND, aes(x = Persistence.log, y = Emergence.logit)) +
+  geom_point(shape = 19, size = 2, alpha = 0.5, col = GREEN) + 
+  geom_line(data = ce_E_P_ND$Persistence.log, aes(x = Persistence.log, y = estimate__), linewidth = 1, linetype = 2) +
+  geom_ribbon(data = ce_E_P_ND$Persistence.log, aes(ymin = lower__, ymax = upper__), fill = "grey50", alpha = 0.25) +
+  xlab("Seed persistence (day) [log scale]") + ylab("Seedling emergence [logit scale]") +
+  scale_x_continuous(breaks = c(2, 3, log10(8000)), labels = c("100", "1000", "8000")) +
+  scale_y_continuous(breaks = c(logit(0.05), logit(0.20), logit(0.50), logit(0.80), logit(0.95), logit(0.99), logit(0.999)),
+                     labels = c("0.05", "0.20", "0.50", "0.80", "0.95", "0.99", "0.999")) +
+  theme_classic(base_size = 16) +
+  theme(axis.text = element_text(colour = "black"), axis.text.y = element_text(hjust = 0.5, angle = 90))
+
+plot_E_P_ND_bm_raw
+```
+
+* MPD
+```{r}
+#-- Model
+bm_E_P_MPD <- brm(data = data_MPD, data2 = list(A = A_MPD), family = gaussian(), 
+                  Emergence.logit ~ Persistence.log + 
+                    (1|species_TPL) + (1|gr(species_TPL_phylo, cov = A)), 
+                  control = list(adapt_delta = 0.99), iter = 5000, cores = 4, chains = 4)
+Ftable(bm_E_P_MPD)    # Not significant
+
+#-- Plot
+ce_E_P_MPD = conditional_effects(bm_E_P_MPD, prob = 0.95)
+
+plot_E_P_MPD_bm_raw = ggplot(data_MPD, aes(x = Persistence.log, y = Emergence.logit)) +
+  geom_point(shape = 19, size = 2, alpha = 0.5, col = GREEN) + 
+  geom_line(data = ce_E_P_MPD$Persistence.log, aes(x = Persistence.log, y = estimate__), linewidth = 1, linetype = 2) +
+  geom_ribbon(data = ce_E_P_MPD$Persistence.log, aes(ymin = lower__, ymax = upper__), fill = "grey50", alpha = 0.25) +
+  xlab("Seed persistence (day) [log scale]") + ylab("Seedling emergence [logit scale]") +
+  scale_x_continuous(breaks = c(2, 3, log10(8000)), labels = c("100", "1000", "8000")) +
+  scale_y_continuous(breaks = c(logit(0.05), logit(0.20), logit(0.50), logit(0.80), logit(0.95), logit(0.99), logit(0.999)),
+                     labels = c("0.05", "0.20", "0.50", "0.80", "0.95", "0.99", "0.999")) +
+  theme_classic(base_size = 16) +
+  theme(axis.text = element_text(colour = "black"), axis.text.y = element_text(hjust = 0.5, angle = 90))
+
+plot_E_P_MPD_bm_raw
+```
+
+* PD
+```{r}
+#-- Model
+bm_E_P_PD <- brm(data = data_PD, data2 = list(A = A_PD), family = gaussian(), 
+                 Emergence.logit ~ Persistence.log + 
+                   (1|species_TPL) + (1|gr(species_TPL_phylo, cov = A)), 
+                 control = list(adapt_delta = 0.99), iter = 5000, cores = 4, chains = 4)
+Ftable(bm_E_P_PD)    # Not significant
+
+#-- Plot
+ce_E_P_PD = conditional_effects(bm_E_P_PD, prob = 0.95)
+
+plot_E_P_PD_bm_raw = ggplot(data_PD, aes(x = Persistence.log, y = Emergence.logit)) +
+  geom_point(shape = 19, size = 2, alpha = 0.5, col = GREEN) + 
+  geom_line(data = ce_E_P_PD$Persistence.log, aes(x = Persistence.log, y = estimate__), linewidth = 1, linetype = 2) +
+  geom_ribbon(data = ce_E_P_PD$Persistence.log, aes(ymin = lower__, ymax = upper__), fill = "grey50", alpha = 0.25) +
+  xlab("Seed persistence (day) [log scale]") + ylab("Seedling emergence [logit scale]") +
+  scale_x_continuous(breaks = c(2, 3, log10(8000)), labels = c("100", "1000", "8000")) +
+  scale_y_continuous(breaks = c(logit(0.05), logit(0.20), logit(0.50), logit(0.80), logit(0.95), logit(0.99), logit(0.999)),
+                     labels = c("0.05", "0.20", "0.50", "0.80", "0.95", "0.99", "0.999")) +
+  theme_classic(base_size = 16) +
+  theme(axis.text = element_text(colour = "black"), axis.text.y = element_text(hjust = 0.5, angle = 90))
+
+plot_E_P_PD_bm_raw
+```
+
+* PY
+```{r}
+#-- Model
+bm_E_P_PY <- brm(data = data_PY, data2 = list(A = A_PY), family = gaussian(), 
+                 Emergence.logit ~ Persistence.log + 
+                   (1|species_TPL) + (1|gr(species_TPL_phylo, cov = A)), 
+                 control = list(adapt_delta = 0.99), iter = 5000, cores = 4, chains = 4)
+Ftable(bm_E_P_PY)    # Not significant
+
+#-- Plot
+ce_E_P_PY = conditional_effects(bm_E_P_PY, prob = 0.95)
+
+plot_E_P_PY_bm_raw = ggplot(data_PY, aes(x = Persistence.log, y = Emergence.logit)) +
+  geom_point(shape = 19, size = 2, alpha = 0.5, col = GREEN) + 
+  geom_line(data = ce_E_P_PY$Persistence.log, aes(x = Persistence.log, y = estimate__), linewidth = 1, linetype = 2) +
+  geom_ribbon(data = ce_E_P_PY$Persistence.log, aes(ymin = lower__, ymax = upper__), fill = "grey50", alpha = 0.25) +
+  xlab("Seed persistence (day) [log scale]") + ylab("Seedling emergence [logit scale]") +
+  scale_x_continuous(breaks = c(2, 3, log10(8000)), labels = c("100", "1000", "8000")) +
+  scale_y_continuous(breaks = c(logit(0.05), logit(0.20), logit(0.50), logit(0.80), logit(0.95), logit(0.99), logit(0.999)),
+                     labels = c("0.05", "0.20", "0.50", "0.80", "0.95", "0.99", "0.999")) +
+  theme_classic(base_size = 16) +
+  theme(axis.text = element_text(colour = "black"), axis.text.y = element_text(hjust = 0.5, angle = 90))
+
+plot_E_P_PY_bm_raw
+```
+
+* Combine
+```{r fig.width = 20, fig.height = 4.5}
+plot_grid(plot_E_P_ND_bm_raw, plot_E_P_MPD_bm_raw, plot_E_P_PD_bm_raw, plot_E_P_PY_bm_raw, 
+          labels = c("ND", "MPD", "PD", "PY"), label_size = 16, nrow = 1,
+          label_x = 0.15, label_y = 1)
+
+ggsave("Rmd/Emergence_Persistence_withinDormancy_bm_raw.jpg", units = "in", width = 20, height = 4.5, dpi = 300)
+```
+
+<br>
+
+## Across group (LS)
+```{r}
+#-- Additive
+bm_E_P_LS <- brm(data = data, data2 = list(A = A), family = gaussian(), 
+                      Emergence.logit ~ Persistence.log + LS + 
+                        (1|species_TPL) + (1|gr(species_TPL_phylo, cov = A)), 
+                      control = list(adapt_delta = 0.99), iter = 5000, cores = 4, chains = 4)
+Ftable(bm_E_P_LS)
+
+#-- Interaction
+bm_E_P_LS_inter <- brm(data = data, data2 = list(A = A), family = gaussian(), 
+                      Emergence.logit ~ Persistence.log + LS + Persistence.log:LS + 
+                        (1|species_TPL) + (1|gr(species_TPL_phylo, cov = A)), 
+                      control = list(adapt_delta = 0.99), iter = 5000, cores = 4, chains = 4)
+Ftable(bm_E_P_LS_inter)
+
+#-- Model selection
+r2_bayes(bm_E_P); r2_bayes(bm_E_P_LS); r2_bayes(bm_E_P_LS_inter)
+loo(bm_E_P, bm_E_P_LS)
+loo(bm_E_P, bm_E_P_LS_inter)
+
+#-- Additive
+# Any difference between two groups?
+h_test <- hypothesis(bm_E_P_LS_inter,
+                     hypothesis = c("Intercept = LSPerennial + Intercept"))
+
+mcmc_intervals(h_test$samples, pars = c("H1"), prob = 0.90, prob_outer = 0.95, point_est = "mean", point_size = 6) +
+  xlab("Estimate") +
+  scale_y_discrete(breaks = c("H1"),
+                   labels = c("Annual - Perennial"),
+                   limits = rev) +
+  theme_classic(base_size = 16) +
+  theme(axis.text = element_text(colour = "black"))
+ggsave("Emergence_Persistence_LS_hypothesis.jpg", units = "in", width = 8, height = 6, dpi = 300)
+
+# For Interaction
+# Do slopes differ from 0?
+h_test <- hypothesis(bm_E_P_LS_inter,
+                     hypothesis = c("Persistence.log  = 0",
+                                    "Persistence.log + Persistence.log:LSPerennial  = 0"))
+
+mcmc_intervals(h_test$samples, pars = c("H1", "H2"), prob = 0.90, prob_outer = 0.95, point_est = "mean", point_size = 6) +
+  xlab("Estimate") +
+  scale_y_discrete(breaks = c("H1", "H2"),
+                   labels = c("Annual slope", "Perennial slope"),
+                   limits = rev) +
+  theme_classic(base_size = 16) +
+  theme(axis.text = element_text(colour = "black"))
+ggsave("Emergence_Persistence_LS_inter_hypothesis.jpg", units = "in", width = 8, height = 6, dpi = 300)
+
+# Plot the E~P slopes in each group
+ce = conditional_effects(bm_E_P_LS_inter, prob = 0.95)
+plot_E_P_LS_inter_bm = ggplot(data = ce$`Persistence.log:LS`, aes(x = Persistence.log, y = estimate__)) +
+  geom_line(aes(col = LS, linetype = LS), size = 1) +
+  scale_linetype_manual(values = c(1, 2)) +
+  geom_ribbon(aes(ymin = lower__, ymax = upper__, fill = LS), alpha = 0.25) +
+  xlab("Seed persistence (day) [log scale]") + ylab("Seedling emergence [logit scale]") +
+  scale_x_continuous(breaks = c(2, 3, log10(8000)), labels = c("100", "1000", "8000")) +
+  scale_y_continuous(breaks = c(logit(0.05), logit(0.20), logit(0.50), logit(0.80), logit(0.95), logit(0.99), logit(0.999)),
+                     labels = c("0.05", "0.20", "0.50", "0.80", "0.95", "0.99", "0.999")) +
+  theme_classic(base_size = 16) +
+  theme(axis.text = element_text(colour = "black"), axis.text.y = element_text(hjust = 0.5, angle = 90)) +
+  theme(legend.position = c("0.11", "0.85"))
+
+plot_E_P_LS_inter_bm
+ggsave("Emergence_Persistence_LS_inter_bm.jpg", units = "in", width = 8, height = 6, dpi = 300)
+```
+
+<br>
+
+## Within group (LS)
+* Annual
+```{r}
+#-- Model
+bm_E_P_Annual <- brm(data = data_Annual, data2 = list(A = A_Annual), family = gaussian(), 
+                 Emergence.logit ~ Persistence.log + 
+                   (1|species_TPL) + (1|gr(species_TPL_phylo, cov = A)), 
+                 control = list(adapt_delta = 0.99), iter = 5000, cores = 4, chains = 4)
+Ftable(bm_E_P_Annual)    # Marginally significant
+
+#-- Plot
+ce_E_P_Annual = conditional_effects(bm_E_P_Annual, prob = 0.95)
+
+plot_E_P_Annual_bm_raw = ggplot(data_Annual, aes(x = Persistence.log, y = Emergence.logit)) +
+  geom_point(shape = 19, size = 2, alpha = 0.5, col = ORANGE) + 
+  geom_line(data = ce_E_P_Annual$Persistence.log, aes(x = Persistence.log, y = estimate__), linewidth = 1, linetype = 1) +
+  geom_ribbon(data = ce_E_P_Annual$Persistence.log, aes(ymin = lower__, ymax = upper__), fill = "grey50", alpha = 0.25) +
+  xlab("Seed persistence (day) [log scale]") + ylab("Seedling emergence [logit scale]") +
+  scale_x_continuous(breaks = c(2, 3, log10(8000)), labels = c("100", "1000", "8000")) +
+  scale_y_continuous(breaks = c(logit(0.05), logit(0.20), logit(0.50), logit(0.80), logit(0.95), logit(0.99), logit(0.999)),
+                     labels = c("0.05", "0.20", "0.50", "0.80", "0.95", "0.99", "0.999")) +
+  theme_classic(base_size = 16) +
+  theme(axis.text = element_text(colour = "black"), axis.text.y = element_text(hjust = 0.5, angle = 90))
+
+plot_E_P_Annual_bm_raw
+```
+
+* Perennial
+```{r}
+#-- Model
+bm_E_P_Perennial <- brm(data = data_Perennial, data2 = list(A = A_Perennial), family = gaussian(), 
+                     Emergence.logit ~ Persistence.log + 
+                       (1|species_TPL) + (1|gr(species_TPL_phylo, cov = A)), 
+                     control = list(adapt_delta = 0.99), iter = 5000, cores = 4, chains = 4)
+Ftable(bm_E_P_Perennial)    # Not significant
+
+#-- Plot
+ce_E_P_Perennial = conditional_effects(bm_E_P_Perennial, prob = 0.95)
+
+plot_E_P_Perennial_bm_raw = ggplot(data_Perennial, aes(x = Persistence.log, y = Emergence.logit)) +
+  geom_point(shape = 19, size = 2, alpha = 0.5, col = ORANGE) + 
+  geom_line(data = ce_E_P_Perennial$Persistence.log, aes(x = Persistence.log, y = estimate__), linewidth = 1, linetype = 2) +
+  geom_ribbon(data = ce_E_P_Perennial$Persistence.log, aes(ymin = lower__, ymax = upper__), fill = "grey50", alpha = 0.25) +
+  xlab("Seed persistence (day) [log scale]") + ylab("Seedling emergence [logit scale]") +
+  scale_x_continuous(breaks = c(2, 3, log10(8000)), labels = c("100", "1000", "8000")) +
+  scale_y_continuous(breaks = c(logit(0.05), logit(0.20), logit(0.50), logit(0.80), logit(0.95), logit(0.99), logit(0.999)),
+                     labels = c("0.05", "0.20", "0.50", "0.80", "0.95", "0.99", "0.999")) +
+  theme_classic(base_size = 16) +
+  theme(axis.text = element_text(colour = "black"), axis.text.y = element_text(hjust = 0.5, angle = 90))
+
+plot_E_P_Perennial_bm_raw
+```
+
+* Combine
+```{r fig.width = 10, fig.height = 4.5}
+plot_grid(plot_E_P_Annual_bm_raw, plot_E_P_Perennial_bm_raw, 
+          labels = c("Annnual", "Perennial"), label_size = 16, nrow = 1,
+          label_x = 0.1, label_y = 1)
+
+ggsave("Rmd/Emergence_Persistence_withinLS_bm_raw.jpg", units = "in", width = 10, height = 4.5, dpi = 300)
+```
+
+<br>
+
+## Across group (MP)
+```{r}
+#-- Additive
+bm_E_P_MP <- brm(data = data, data2 = list(A = A), family = gaussian(), 
+                      Emergence.logit ~ Persistence.log + MP + 
+                        (1|species_TPL) + (1|gr(species_TPL_phylo, cov = A)), 
+                      control = list(adapt_delta = 0.99), iter = 5000, cores = 4, chains = 4)
+Ftable(bm_E_P_MP)
+
+#-- Interaction
+bm_E_P_MP_inter <- brm(data = data, data2 = list(A = A), family = gaussian(), 
+                      Emergence.logit ~ Persistence.log + MP + Persistence.log:MP + 
+                        (1|species_TPL) + (1|gr(species_TPL_phylo, cov = A)), 
+                      control = list(adapt_delta = 0.99), iter = 5000, cores = 4, chains = 4)
+Ftable(bm_E_P_MP_inter)
+
+#-- Model selection
+r2_bayes(bm_E_P); r2_bayes(bm_E_P_MP); r2_bayes(bm_E_P_MP_inter)
+loo(bm_E_P, bm_E_P_MP)
+loo(bm_E_P, bm_E_P_MP_inter)
+
+#-- Additive
+# Any difference between two groups?
+h_test <- hypothesis(bm_E_P_MP_inter,
+                     hypothesis = c("Intercept = MPPolycarpic + Intercept"))
+
+mcmc_intervals(h_test$samples, pars = c("H1"), prob = 0.90, prob_outer = 0.95, point_est = "mean", point_size = 6) +
+  xlab("Estimate") +
+  scale_y_discrete(breaks = c("H1"),
+                   labels = c("Monocarpic - Polycarpic"),
+                   limits = rev) +
+  theme_classic(base_size = 16) +
+  theme(axis.text = element_text(colour = "black"))
+ggsave("Emergence_Persistence_MP_hypothesis.jpg", units = "in", width = 8, height = 6, dpi = 300)
+
+# For Interaction
+# Do slopes differ from 0?
+h_test <- hypothesis(bm_E_P_MP_inter,
+                     hypothesis = c("Persistence.log  = 0",
+                                    "Persistence.log + Persistence.log:MPPolycarpic  = 0"))
+
+mcmc_intervals(h_test$samples, pars = c("H1", "H2"), prob = 0.90, prob_outer = 0.95, point_est = "mean", point_size = 6) +
+  xlab("Estimate") +
+  scale_y_discrete(breaks = c("H1", "H2"),
+                   labels = c("Monocarpic slope", "Polycarpic slope"),
+                   limits = rev) +
+  theme_classic(base_size = 16) +
+  theme(axis.text = element_text(colour = "black"))
+ggsave("Emergence_Persistence_MP_inter_hypothesis.jpg", units = "in", width = 8, height = 6, dpi = 300)
+
+# Plot the E~P slopes in each group
+ce = conditional_effects(bm_E_P_MP_inter, prob = 0.95)
+plot_E_P_MP_inter_bm = ggplot(data = ce$`Persistence.log:MP`, aes(x = Persistence.log, y = estimate__)) +
+  geom_line(aes(col = MP, linetype = MP), size = 1) +
+  scale_linetype_manual(values = c(1, 2)) +
+  geom_ribbon(aes(ymin = lower__, ymax = upper__, fill = MP), alpha = 0.25) +
+  xlab("Seed persistence (day) [log scale]") + ylab("Seedling emergence [logit scale]") +
+  scale_x_continuous(breaks = c(2, 3, log10(8000)), labels = c("100", "1000", "8000")) +
+  scale_y_continuous(breaks = c(logit(0.05), logit(0.20), logit(0.50), logit(0.80), logit(0.95), logit(0.99), logit(0.999)),
+                     labels = c("0.05", "0.20", "0.50", "0.80", "0.95", "0.99", "0.999")) +
+  theme_classic(base_size = 16) +
+  theme(axis.text = element_text(colour = "black"), axis.text.y = element_text(hjust = 0.5, angle = 90)) +
+  theme(legend.position = c("0.11", "0.85"))
+
+plot_E_P_MP_inter_bm
+ggsave("Emergence_Persistence_MP_inter_bm.jpg", units = "in", width = 8, height = 6, dpi = 300)
+```
+
+<br>
+
+## Within group (MP)
+* Monocarpic
+```{r}
+#-- Model
+bm_E_P_Monocarpic <- brm(data = data_Monocarpic, data2 = list(A = A_Monocarpic), family = gaussian(), 
+                        Emergence.logit ~ Persistence.log + 
+                          (1|species_TPL) + (1|gr(species_TPL_phylo, cov = A)), 
+                        control = list(adapt_delta = 0.99), iter = 5000, cores = 4, chains = 4)
+Ftable(bm_E_P_Monocarpic)    # Marginally significant
+
+#-- Plot
+ce_E_P_Monocarpic = conditional_effects(bm_E_P_Monocarpic, prob = 0.95)
+
+plot_E_P_Monocarpic_bm_raw = ggplot(data_Monocarpic, aes(x = Persistence.log, y = Emergence.logit)) +
+  geom_point(shape = 19, size = 2, alpha = 0.5, col = BLUE) + 
+  geom_line(data = ce_E_P_Monocarpic$Persistence.log, aes(x = Persistence.log, y = estimate__), linewidth = 1, linetype = 1) +
+  geom_ribbon(data = ce_E_P_Monocarpic$Persistence.log, aes(ymin = lower__, ymax = upper__), fill = "grey50", alpha = 0.25) +
+  xlab("Seed persistence (day) [log scale]") + ylab("Seedling emergence [logit scale]") +
+  scale_x_continuous(breaks = c(2, 3, log10(8000)), labels = c("100", "1000", "8000")) +
+  scale_y_continuous(breaks = c(logit(0.05), logit(0.20), logit(0.50), logit(0.80), logit(0.95), logit(0.99), logit(0.999)),
+                     labels = c("0.05", "0.20", "0.50", "0.80", "0.95", "0.99", "0.999")) +
+  theme_classic(base_size = 16) +
+  theme(axis.text = element_text(colour = "black"), axis.text.y = element_text(hjust = 0.5, angle = 90))
+
+plot_E_P_Monocarpic_bm_raw
+```
+
+* Polycarpic
+```{r}
+#-- Model
+bm_E_P_Polycarpic <- brm(data = data_Polycarpic, data2 = list(A = A_Polycarpic), family = gaussian(), 
+                         Emergence.logit ~ Persistence.log + 
+                           (1|species_TPL) + (1|gr(species_TPL_phylo, cov = A)), 
+                         control = list(adapt_delta = 0.99), iter = 5000, cores = 4, chains = 4)
+Ftable(bm_E_P_Polycarpic)    # Not significant
+
+#-- Plot
+ce_E_P_Polycarpic = conditional_effects(bm_E_P_Polycarpic, prob = 0.95)
+
+plot_E_P_Polycarpic_bm_raw = ggplot(data_Polycarpic, aes(x = Persistence.log, y = Emergence.logit)) +
+  geom_point(shape = 19, size = 2, alpha = 0.5, col = BLUE) + 
+  geom_line(data = ce_E_P_Polycarpic$Persistence.log, aes(x = Persistence.log, y = estimate__), linewidth = 1, linetype = 2) +
+  geom_ribbon(data = ce_E_P_Polycarpic$Persistence.log, aes(ymin = lower__, ymax = upper__), fill = "grey50", alpha = 0.25) +
+  xlab("Seed persistence (day) [log scale]") + ylab("Seedling emergence [logit scale]") +
+  scale_x_continuous(breaks = c(2, 3, log10(8000)), labels = c("100", "1000", "8000")) +
+  scale_y_continuous(breaks = c(logit(0.05), logit(0.20), logit(0.50), logit(0.80), logit(0.95), logit(0.99), logit(0.999)),
+                     labels = c("0.05", "0.20", "0.50", "0.80", "0.95", "0.99", "0.999")) +
+  theme_classic(base_size = 16) +
+  theme(axis.text = element_text(colour = "black"), axis.text.y = element_text(hjust = 0.5, angle = 90))
+
+plot_E_P_Polycarpic_bm_raw
+```
+
+* Combine
+```{r fig.width = 10, fig.height = 4.5}
+plot_grid(plot_E_P_Monocarpic_bm_raw, plot_E_P_Polycarpic_bm_raw, 
+          labels = c("Monocarpic", "Polycarpic"), label_size = 16, nrow = 1,
+          label_x = 0.1, label_y = 1)
+
+ggsave("Rmd/Emergence_Persistence_withinMP_bm_raw.jpg", units = "in", width = 10, height = 4.5, dpi = 300)
+```
+
+<br>
+
+## Figure 2
+```{r fig.width = 5, fig.height = 6.5}
+#-- Combine
+post_E_P = posterior_samples(bm_E_P) %>% as_tibble() %>% select(b_Persistence.log) %>% mutate(Group = "Overall", Subset = "Overall")
+post_E_P_ND = posterior_samples(bm_E_P_ND) %>% as_tibble() %>% select(b_Persistence.log) %>% mutate(Group = "Dormancy", Subset = "ND")
+post_E_P_MPD = posterior_samples(bm_E_P_MPD) %>% as_tibble() %>% select(b_Persistence.log) %>% mutate(Group = "Dormancy", Subset = "MPD")
+post_E_P_PD = posterior_samples(bm_E_P_PD) %>% as_tibble() %>% select(b_Persistence.log) %>% mutate(Group = "Dormancy", Subset = "PD")
+post_E_P_PY = posterior_samples(bm_E_P_PY) %>% as_tibble() %>% select(b_Persistence.log) %>% mutate(Group = "Dormancy", Subset = "PY")
+post_E_P_Annual = posterior_samples(bm_E_P_Annual) %>% as_tibble() %>% select(b_Persistence.log) %>% mutate(Group = "LS", Subset = "Annual")
+post_E_P_Perennial = posterior_samples(bm_E_P_Perennial) %>% as_tibble() %>% select(b_Persistence.log) %>% mutate(Group = "LS", Subset = "Perennial")
+post_E_P_Monocarpic = posterior_samples(bm_E_P_Monocarpic) %>% as_tibble() %>% select(b_Persistence.log) %>% mutate(Group = "MP", Subset = "Monocarpic")
+post_E_P_Polycarpic = posterior_samples(bm_E_P_Polycarpic) %>% as_tibble() %>% select(b_Persistence.log) %>% mutate(Group = "MP", Subset = "Polycarpic")
+
+post_E_P_all = bind_rows(post_E_P, 
+          post_E_P_ND, post_E_P_MPD, post_E_P_PD, post_E_P_PY,
+          post_E_P_Annual, post_E_P_Perennial,
+          post_E_P_Monocarpic, post_E_P_Polycarpic)
+post_E_P_all$Group = factor(post_E_P_all$Group, levels = c("Overall", "Dormancy", "LS", "MP"))
+post_E_P_all$Subset = factor(post_E_P_all$Subset, levels = c("Overall", 
+                                                             "ND", "MPD", "PD", "PY", 
+                                                             "Annual", "Perennial",
+                                                             "Monocarpic", "Polycarpic"))
+
+
+#-- Plot
+post_E_P_all %>% 
+  #---- locations ----#
+mutate(loc = as.numeric(Subset),
+       loc = ifelse(loc %in% 8:9, loc + 3, 
+                    ifelse(loc %in% 6:7, loc + 2, 
+                           ifelse(loc %in% 2:5, loc + 1, loc)))) %>% 
+  #---- plot ----#
+  ggplot(aes(x = b_Persistence.log, y = loc, fill = Group)) + 
+  scale_y_reverse(breaks = c(1, 3:6, 8:9, 11:12), labels = c("Overall", 
+                                                              "ND", "MPD", "PD", "PY", 
+                                                              "Annual", "Perennial",
+                                                              "Monocarpic", "Polycarpic")) +
+  stat_halfeyeh(.width = 0.95, interval_size = 1.5, point_size = 2, slab_alpha = 0.5) +
+  geom_vline(xintercept = 0, linetype = "dashed") + 
+  scale_fill_manual(values = c("grey50", brewer_pal(palette = "Set2")(3))) +
+  xlab("Slope") + ylab(NULL) +
+  theme_test(base_size = 16) +
+  theme(legend.position = "none") +
+  theme(axis.text = element_text(colour = "black"))
+
+ggsave("Rmd/Emergence_Persistence_bm_all.jpg", units = "in", width = 5, height = 6.5, dpi = 300)
+```
+
+<br>
+
+
+# Dormancy
+## Persistence.log ~ Dormancy
+```{r}
+#-- Model
+bm_P_D <- brm(data = data, data2 = list(A = A), family = gaussian(), 
+           Persistence.log ~ Dormancy + 
+             (1|species_TPL) + (1|gr(species_TPL_phylo, cov = A)), 
+           control = list(adapt_delta = 0.99), iter = 5000, cores = 4, chains = 4)
+Ftable(bm_P_D)
+
+
+#-- Multiple comparison
+h_test <- hypothesis(bm_P_D,
+                   hypothesis = c("DormancyPY + Intercept  = DormancyPD + Intercept",
+                                  "DormancyPY + Intercept  = DormancyMPD + Intercept", 
+                                  "DormancyPY + Intercept  = Intercept", 
+                                  "DormancyPD + Intercept  = DormancyMPD + Intercept", 
+                                  "DormancyPD + Intercept  = Intercept", 
+                                  "DormancyMPD + Intercept  = Intercept"))
+
+as_tibble(h_test$hypothesis) %>% dplyr::select(1:5) %>% 
+  kable(align = "lr", digits = 3) %>% 
+  kable_styling(full_width = F)
+  
+mcmc_intervals(h_test$samples, pars = c("H1", "H2", "H3", "H4", "H5", "H6"), prob = 0.90, prob_outer = 0.95, point_est = "mean", point_size = 6) +
+  xlab("Estimate") +
+  scale_y_discrete(breaks = c("H1", "H2", "H3", "H4", "H5", "H6"),
+                   labels = c("PY - PD", "PY - MPD", "PY - ND", "PD - MPD", "PD - ND", "MPD - ND"),
+                   limits = rev) +
+  theme_classic(base_size = 16) +
+  theme(axis.text = element_text(colour = "black"))
+
+ggsave("Rmd/Persistence_Dormancy_hypothesis.jpg", units = "in", width = 8, height = 6, dpi = 300)
+
+
+#-- Plot
+ce = conditional_effects(bm_P_D, prob = 0.95)
+
+plot_P_D_bm_raw = ggplot(data = data, aes(x = Dormancy, y = Persistence.log))  +
+  geom_flat_violin(fill = GREEN, position = position_nudge(x = 0.05), colour = "black", size = 0.5, alpha = 0.5, trim = TRUE) +
+  geom_jitter(aes(x = stage(start = Dormancy, after_scale = x - 0.15)), fill = GREEN, shape = 21, width = 0.1, alpha = 0.5) +
+  geom_pointrange(aes(y = estimate__, ymin = lower__, ymax = upper__),
+                  data = ce$Dormancy, size = 1, position = position_nudge(x = 0.05)) +
+  xlab("Dormancy type") + ylab("Seed persistence (day) [log scale]") +
+  scale_y_continuous(breaks = c(2, 3, 4), labels = c("100", "1000", "10000"), limits = c(1.84, 3.98)) +
+  theme_classic(base_size = 16) +
+  theme(legend.position = "none") +
+  theme(axis.text = element_text(colour = "black"), axis.text.y = element_text(hjust = 0.5, angle = 90)) +
+  geom_text(data = ce$Dormancy, aes(x = Dormancy, y = 3.98, label = c("A", "A", "A", "B")), size = 6)
+
+plot_P_D_bm_raw
+
+ggsave("Rmd/Persistence_Dormancy_bm_raw.jpg", units = "in", width = 8, height = 6, dpi = 300)
+```
+
+<br>
+
+## Emergence.logit ~ Dormancy
+```{r}
+#-- Model
+bm_E_D <- brm(data = data, data2 = list(A = A), family = gaussian(), 
+              Emergence.logit ~ Dormancy + 
+                (1|species_TPL) + (1|gr(species_TPL_phylo, cov = A)), 
+              control = list(adapt_delta = 0.99), iter = 5000, cores = 4, chains = 4)
+Ftable(bm_E_D)
+
+
+#-- Multiple comparison
+h_test <- hypothesis(bm_E_D,
+                     hypothesis = c("DormancyPY + Intercept  = DormancyPD + Intercept",
+                                    "DormancyPY + Intercept  = DormancyMPD + Intercept", 
+                                    "DormancyPY + Intercept  = Intercept", 
+                                    "DormancyPD + Intercept  = DormancyMPD + Intercept", 
+                                    "DormancyPD + Intercept  = Intercept", 
+                                    "DormancyMPD + Intercept  = Intercept"))
+
+as_tibble(h_test$hypothesis) %>% dplyr::select(1:5) %>% 
+  kable(align = "lr", digits = 3) %>% 
+  kable_styling(full_width = F)
+
+mcmc_intervals(h_test$samples, pars = c("H1", "H2", "H3", "H4", "H5", "H6"), prob = 0.90, prob_outer = 0.95, point_est = "mean", point_size = 6) +
+  xlab("Estimate") +
+  scale_y_discrete(breaks = c("H1", "H2", "H3", "H4", "H5", "H6"),
+                   labels = c("PY - PD", "PY - MPD", "PY - ND", "PD - MPD", "PD - ND", "MPD - ND"),
+                   limits = rev) +
+  theme_classic(base_size = 16) +
+  theme(axis.text = element_text(colour = "black"))
+
+ggsave("Rmd/Emergence_Dormancy_hypothesis.jpg", units = "in", width = 8, height = 6, dpi = 300)
+
+
+#-- Plot
+ce = conditional_effects(bm_E_D, prob = 0.95)
+
+plot_E_D_bm_raw = ggplot(data = data, aes(x = Dormancy, y = Emergence.logit))  +
+  geom_flat_violin(fill = GREEN, position = position_nudge(x = 0.05), colour = "black", size = 0.5, alpha = 0.5, trim = TRUE) +
+  geom_jitter(aes(x = stage(start = Dormancy, after_scale = x - 0.15)), fill = GREEN, shape = 21, width = 0.1, alpha = 0.5) +
+  geom_pointrange(aes(y = estimate__, ymin = lower__, ymax = upper__),
+                  data = ce$Dormancy, size = 1, position = position_nudge(x = 0.05)) +
+  xlab("Dormancy type") + ylab("Seedling emergence [logit scale]") +
+  scale_y_continuous(breaks = c(logit(0.02), logit(0.12), logit(0.50), logit(0.88), logit(0.98), logit(0.999)),
+                     labels = c("0.02", "0.12", "0.50", "0.88", "0.98", "0.999")) +
+  theme_classic(base_size = 16) +
+  theme(legend.position = "none") +
+  theme(axis.text = element_text(colour = "black"), axis.text.y = element_text(hjust = 0.5, angle = 90)) +
+  geom_text(data = ce$Dormancy, aes(x = Dormancy, y = 6.91, label = c("A", "B", "B", "B")), size = 6)
+
+plot_E_D_bm_raw
+
+ggsave("Rmd/Emergence_Dormancy_bm_raw.jpg", units = "in", width = 8, height = 6, dpi = 300)
+```
+
+<br>
+
+
+# LS
+## Persistence.log ~ LS
+```{r}
+#-- Model
+bm_P_LS <- brm(data = data, data2 = list(A = A), family = gaussian(), 
+               Persistence.log ~ LS + 
+                 (1|species_TPL) + (1|gr(species_TPL_phylo, cov = A)), 
+               control = list(adapt_delta = 0.99), iter = 5000, cores = 4, chains = 4)
+Ftable(bm_P_LS)
+
+
+#-- Plot
+ce = conditional_effects(bm_P_LS, prob = 0.95)
+
+plot_P_LS_bm_raw = ggplot(data = data, aes(x = LS, y = Persistence.log))  +
+  geom_flat_violin(fill = ORANGE, position = position_nudge(x = 0.05), colour = "black", size = 0.5, alpha = 0.5, trim = TRUE) +
+  geom_jitter(aes(x = stage(start = LS, after_scale = x - 0.15)), fill = ORANGE, shape = 21, width = 0.1, alpha = 0.5) +
+  geom_pointrange(aes(y = estimate__, ymin = lower__, ymax = upper__),
+                  data = ce$LS, size = 1, position = position_nudge(x = 0.05)) +
+  scale_fill_brewer(palette = "Set1") +
+  xlab("Adult life span") + ylab("Seed persistence (day) [log scale]") +
+  scale_y_continuous(breaks = c(2, 3, 4), labels = c("100", "1000", "10000"), limits = c(1.84, 3.98)) +
+  theme_classic(base_size = 16) +
+  theme(legend.position = "none") +
+  theme(axis.text = element_text(colour = "black"), axis.text.y = element_text(hjust = 0.5, angle = 90)) +
+  geom_text(data = ce$LS, aes(x = LS, y = 3.98, label = c("A", "A")), size = 6)
+
+plot_P_LS_bm_raw
+
+ggsave("Rmd/Persistence_LS_bm_raw.jpg", units = "in", width = 6, height = 6, dpi = 300)
+```
+
+<br>
+
+## Emergence.logit ~ LS
+```{r}
+#-- Model
+bm_E_LS <- brm(data = data, data2 = list(A = A), family = gaussian(), 
+               Emergence.logit ~ LS + 
+                 (1|species_TPL) + (1|gr(species_TPL_phylo, cov = A)), 
+               control = list(adapt_delta = 0.99), iter = 5000, cores = 4, chains = 4)
+Ftable(bm_E_LS)
+
+
+#-- Plot
+ce = conditional_effects(bm_E_LS, prob = 0.95)
+
+plot_E_LS_bm_raw = ggplot(data = data, aes(x = LS, y = Emergence.logit))  +
+  geom_flat_violin(fill = ORANGE, position = position_nudge(x = 0.05), colour = "black", size = 0.5, alpha = 0.5, trim = TRUE) +
+  geom_jitter(aes(x = stage(start = LS, after_scale = x - 0.15)), fill = ORANGE, shape = 21, width = 0.1, alpha = 0.5) +
+  geom_pointrange(aes(y = estimate__, ymin = lower__, ymax = upper__),
+                  data = ce$LS, size = 1, position = position_nudge(x = 0.05)) +
+  scale_fill_brewer(palette = "Set1") +
+  xlab("Adult life span") + ylab("Seedling emergence [logit scale]") +
+  scale_y_continuous(breaks = c(logit(0.02), logit(0.12), logit(0.50), logit(0.88), logit(0.98), logit(0.999)),
+                     labels = c("0.02", "0.12", "0.50", "0.88", "0.98", "0.999")) +
+  theme_classic(base_size = 16) +
+  theme(legend.position = "none") +
+  theme(axis.text = element_text(colour = "black"), axis.text.y = element_text(hjust = 0.5, angle = 90)) +
+  geom_text(data = ce$LS, aes(x = LS, y = 6.91, label = c("A", "B")), size = 6)
+
+plot_E_LS_bm_raw
+
+ggsave("Rmd/Emergence_LS_bm_raw.jpg", units = "in", width = 6, height = 6, dpi = 300)
+```
+
+<br>
+
+
+# MP
+## Persistence.log ~ MP
+```{r}
+#-- Model
+bm_P_MP <- brm(data = data, data2 = list(A = A), family = gaussian(), 
+               Persistence.log ~ MP + 
+                 (1|species_TPL) + (1|gr(species_TPL_phylo, cov = A)), 
+               control = list(adapt_delta = 0.99), iter = 5000, cores = 4, chains = 4)
+Ftable(bm_P_MP)
+
+
+#-- Plot
+ce = conditional_effects(bm_P_MP, prob = 0.95)
+
+plot_P_MP_bm_raw = ggplot(data = data, aes(x = MP, y = Persistence.log))  +
+  geom_flat_violin(fill = BLUE, position = position_nudge(x = 0.05), colour = "black", size = 0.5, alpha = 0.5, trim = TRUE) +
+  geom_jitter(aes(x = stage(start = MP, after_scale = x - 0.15)), fill = BLUE, shape = 21, width = 0.1, alpha = 0.5) +
+  geom_pointrange(aes(y = estimate__, ymin = lower__, ymax = upper__),
+                  data = ce$MP, size = 1, position = position_nudge(x = 0.05)) +
+  scale_fill_brewer(palette = "Accent") +
+  xlab("Adult life span") + ylab("Seed persistence (day) [log scale]") +
+  scale_y_continuous(breaks = c(2, 3, 4), labels = c("100", "1000", "10000"), limits = c(1.84, 3.98)) +
+  theme_classic(base_size = 16) +
+  theme(legend.position = "none") +
+  theme(axis.text = element_text(colour = "black"), axis.text.y = element_text(hjust = 0.5, angle = 90)) +
+  geom_text(data = ce$MP, aes(x = MP, y = 3.98, label = c("A", "B")), size = 6)
+
+plot_P_MP_bm_raw
+
+ggsave("Rmd/Persistence_MP_bm_raw.jpg", units = "in", width = 6, height = 6, dpi = 300)
+```
+
+<br>
+
+## Emergence.logit ~ MP
+```{r}
+#-- Model
+bm_E_MP <- brm(data = data, data2 = list(A = A), family = gaussian(), 
+               Emergence.logit ~ MP + 
+                 (1|species_TPL) + (1|gr(species_TPL_phylo, cov = A)), 
+               control = list(adapt_delta = 0.99), iter = 5000, cores = 4, chains = 4)
+Ftable(bm_E_MP)
+
+
+#-- Plot
+ce = conditional_effects(bm_E_MP, prob = 0.95)
+
+plot_E_MP_bm_raw = ggplot(data = data, aes(x = MP, y = Emergence.logit))  +
+  geom_flat_violin(fill = BLUE, position = position_nudge(x = 0.05), colour = "black", size = 0.5, alpha = 0.5, trim = TRUE) +
+  geom_jitter(aes(x = stage(start = MP, after_scale = x - 0.15)), fill = BLUE, shape = 21, width = 0.1, alpha = 0.5) +
+  geom_pointrange(aes(y = estimate__, ymin = lower__, ymax = upper__),
+                  data = ce$MP, size = 1, position = position_nudge(x = 0.05)) +
+  scale_fill_brewer(palette = "Accent") +
+  xlab("Reproductive frequency") + ylab("Seedling emergence [logit scale]") +
+  scale_y_continuous(breaks = c(logit(0.02), logit(0.12), logit(0.50), logit(0.88), logit(0.98), logit(0.999)),
+                     labels = c("0.02", "0.12", "0.50", "0.88", "0.98", "0.999")) +
+  theme_classic(base_size = 16) +
+  theme(legend.position = "none") +
+  theme(axis.text = element_text(colour = "black"), axis.text.y = element_text(hjust = 0.5, angle = 90)) +
+  geom_text(data = ce$MP, aes(x = MP, y = 6.91, label = c("A", "B")), size = 6)
+
+plot_E_MP_bm_raw
+
+ggsave("Rmd/Emergence_MP_bm_raw.jpg", units = "in", width = 6, height = 6, dpi = 300)
+```
+
+<br>
+
+
+# SM.log
+## Persistence.log ~ SM.log (Overall)
+```{r}
+#-- Model
+bm_P_SM <- brm(data = data, data2 = list(A = A), family = gaussian(), 
+           Persistence.log ~ SM.log + 
+             (1|species_TPL) + (1|gr(species_TPL_phylo, cov = A)), 
+           control = list(adapt_delta = 0.99), iter = 5000, cores = 4, chains = 4)
+Ftable(bm_P_SM)    # Marginally significant
+
+
+#-- Plot
+ce = conditional_effects(bm_P_SM, prob = 0.95)
+
+plot_P_SM_bm_raw = ggplot(data, aes(x = SM.log, y = Persistence.log)) +
+  geom_point(shape = 19, size = 2, alpha = 0.5, col = "grey50") + 
+  geom_line(data = ce$SM.log, aes(x = SM.log, y = estimate__), linewidth = 1, linetype = 2) +
+  geom_ribbon(data = ce$SM.log, aes(ymin = lower__, ymax = upper__), fill = "grey50", alpha = 0.25) +
+  xlab("Seed mass (mg) [log scale]") + ylab("Seed persistence (day) [log scale]") +
+  scale_x_continuous(breaks = c(-2, -1, 0, 1, 2), labels = c("0.01", "0.1", "1", "10", "100")) + 
+  scale_y_continuous(breaks = c(2, 3, 4), labels = c("100", "1000", "10000"), limits = c(1.84, 3.98)) +
+  theme_classic(base_size = 16) +
+  theme(legend.position = "none") +
+  theme(axis.text = element_text(colour = "black"), axis.text.y = element_text(hjust = 0.5, angle = 90))
+
+plot_P_SM_bm_raw
+
+ggsave("Rmd/Persistence_SM_bm_raw.jpg", units = "in", width = 8, height = 6, dpi = 300)
+```
+
+
+## Persistence.log ~ SM.log (Within group)
+### Dormancy
+* ND
+```{r}
+bm_P_SM_ND <- brm(data = data_ND, data2 = list(A = A_ND), family = gaussian(), 
+                  Persistence.log ~ SM.log + 
+                    (1|species_TPL) + (1|gr(species_TPL_phylo, cov = A)), 
+                  control = list(adapt_delta = 0.99), iter = 5000, cores = 4, chains = 4)
+Ftable(bm_P_SM_ND)    # Not significant
+```
+
+* MPD
+```{r}
+bm_P_SM_MPD <- brm(data = data_MPD, data2 = list(A = A_MPD), family = gaussian(), 
+                  Persistence.log ~ SM.log + 
+                    (1|species_TPL) + (1|gr(species_TPL_phylo, cov = A)), 
+                  control = list(adapt_delta = 0.99), iter = 5000, cores = 4, chains = 4)
+Ftable(bm_P_SM_MPD)    # Marginally significant
+```
+
+* PD
+```{r}
+bm_P_SM_PD <- brm(data = data_PD, data2 = list(A = A_PD), family = gaussian(), 
+                   Persistence.log ~ SM.log + 
+                     (1|species_TPL) + (1|gr(species_TPL_phylo, cov = A)), 
+                   control = list(adapt_delta = 0.99), iter = 5000, cores = 4, chains = 4)
+Ftable(bm_P_SM_PD)    # Not significant
+```
+
+* PY
+```{r}
+bm_P_SM_PY <- brm(data = data_PY, data2 = list(A = A_PY), family = gaussian(), 
+                  Persistence.log ~ SM.log + 
+                    (1|species_TPL) + (1|gr(species_TPL_phylo, cov = A)), 
+                  control = list(adapt_delta = 0.99), iter = 5000, cores = 4, chains = 4)
+Ftable(bm_P_SM_PY)    # Not significant
+```
+
+<br>
+
+### LS
+* Annual
+```{r}
+bm_P_SM_Annual <- brm(data = data_Annual, data2 = list(A = A_Annual), family = gaussian(), 
+                      Persistence.log ~ SM.log + 
+                       (1|species_TPL) + (1|gr(species_TPL_phylo, cov = A)), 
+                     control = list(adapt_delta = 0.99), iter = 5000, cores = 4, chains = 4)
+Ftable(bm_P_SM_Annual)    # Marginally significant
+```
+
+* Perennial
+```{r}
+bm_P_SM_Perennial <- brm(data = data_Perennial, data2 = list(A = A_Perennial), family = gaussian(), 
+                        Persistence.log ~ SM.log + 
+                          (1|species_TPL) + (1|gr(species_TPL_phylo, cov = A)), 
+                        control = list(adapt_delta = 0.99), iter = 5000, cores = 4, chains = 4)
+Ftable(bm_P_SM_Perennial)    # Non significant
+```
+
+<br>
+
+### MP
+* Monocarpic
+```{r}
+bm_P_SM_Monocarpic <- brm(data = data_Monocarpic, data2 = list(A = A_Monocarpic), family = gaussian(), 
+                  Persistence.log ~ SM.log + 
+                    (1|species_TPL) + (1|gr(species_TPL_phylo, cov = A)), 
+                  control = list(adapt_delta = 0.99), iter = 5000, cores = 4, chains = 4)
+Ftable(bm_P_SM_Monocarpic)    # Not significant
+```
+
+* Polycarpic
+```{r}
+bm_P_SM_Polycarpic <- brm(data = data_Polycarpic, data2 = list(A = A_Polycarpic), family = gaussian(), 
+                          Persistence.log ~ SM.log + 
+                            (1|species_TPL) + (1|gr(species_TPL_phylo, cov = A)), 
+                          control = list(adapt_delta = 0.99), iter = 5000, cores = 4, chains = 4)
+Ftable(bm_P_SM_Polycarpic)    # Not significant
+```
+
+<br>
+
+### Combine
+```{r fig.width = 5, fig.height = 6.5}
+#-- Combine
+post_P_SM = posterior_samples(bm_P_SM) %>% as_tibble() %>% select(b_SM.log) %>% mutate(Group = "Overall", Subset = "Overall")
+post_P_SM_ND = posterior_samples(bm_P_SM_ND) %>% as_tibble() %>% select(b_SM.log) %>% mutate(Group = "Dormancy", Subset = "ND")
+post_P_SM_MPD = posterior_samples(bm_P_SM_MPD) %>% as_tibble() %>% select(b_SM.log) %>% mutate(Group = "Dormancy", Subset = "MPD")
+post_P_SM_PD = posterior_samples(bm_P_SM_PD) %>% as_tibble() %>% select(b_SM.log) %>% mutate(Group = "Dormancy", Subset = "PD")
+post_P_SM_PY = posterior_samples(bm_P_SM_PY) %>% as_tibble() %>% select(b_SM.log) %>% mutate(Group = "Dormancy", Subset = "PY")
+post_P_SM_Annual = posterior_samples(bm_P_SM_Annual) %>% as_tibble() %>% select(b_SM.log) %>% mutate(Group = "LS", Subset = "Annual")
+post_P_SM_Perennial = posterior_samples(bm_P_SM_Perennial) %>% as_tibble() %>% select(b_SM.log) %>% mutate(Group = "LS", Subset = "Perennial")
+post_P_SM_Monocarpic = posterior_samples(bm_P_SM_Monocarpic) %>% as_tibble() %>% select(b_SM.log) %>% mutate(Group = "MP", Subset = "Monocarpic")
+post_P_SM_Polycarpic = posterior_samples(bm_P_SM_Polycarpic) %>% as_tibble() %>% select(b_SM.log) %>% mutate(Group = "MP", Subset = "Polycarpic")
+
+post_P_SM_all = bind_rows(post_P_SM, 
+                         post_P_SM_ND, post_P_SM_MPD, post_P_SM_PD, post_P_SM_PY,
+                         post_P_SM_Annual, post_P_SM_Perennial,
+                         post_P_SM_Monocarpic, post_P_SM_Polycarpic)
+post_P_SM_all$Group = factor(post_P_SM_all$Group, levels = c("Overall", "Dormancy", "LS", "MP"))
+post_P_SM_all$Subset = factor(post_P_SM_all$Subset, levels = c("Overall", 
+                                                             "ND", "MPD", "PD", "PY", 
+                                                             "Annual", "Perennial",
+                                                             "Monocarpic", "Polycarpic"))
+
+# A better plot
+post_P_SM_all %>% 
+  #---- locations ----#
+  mutate(loc = as.numeric(Subset),
+         loc = ifelse(loc %in% 8:9, loc + 3, 
+                      ifelse(loc %in% 6:7, loc + 2, 
+                             ifelse(loc %in% 2:5, loc + 1, loc)))) %>% 
+  #---- plot ----#
+  ggplot(aes(x = b_SM.log, y = loc, fill = Group)) + 
+  scale_y_reverse(breaks = c(1, 3:6, 8:9, 11:12), labels = c("Overall", 
+                                                             "ND", "MPD", "PD", "PY", 
+                                                             "Annual", "Perennial",
+                                                             "Monocarpic", "Polycarpic")) +
+  stat_halfeyeh(.width = 0.95, interval_size = 1.5, point_size = 2, slab_alpha = 0.5) +
+  geom_vline(xintercept = 0, linetype = "dashed") + 
+  scale_fill_manual(values = c("grey50", brewer_pal(palette = "Set2")(3))) +
+  xlab("Slope") + ylab(NULL) +
+  theme_test(base_size = 16) +
+  theme(legend.position = "none") +
+  theme(axis.text = element_text(colour = "black"))
+
+ggsave("Rmd/Persistence_SM_bm_all.jpg", units = "in", width = 5, height = 6.5, dpi = 300)
+```
+
+
+## Persistence.log ~ SM.log (Additive)
+* Persistence.log ~ SM.log + Dormancy
+```{r}
+bm_P_SM_D <- brm(data = data, data2 = list(A = A), family = gaussian(), 
+                       Persistence.log ~ SM.log + Dormancy +
+                         (1|species_TPL) + (1|gr(species_TPL_phylo, cov = A)), 
+                       control = list(adapt_delta = 0.99), iter = 5000, cores = 4, chains = 4)
+Ftable(bm_P_SM_D)
+
+#-- Model selection
+r2_bayes(bm_P_D); r2_bayes(bm_P_SM_D)
+loo(bm_P_D, bm_P_SM_D)
+```
+
+<br>
+
+* Persistence.log ~ SM.log + LS
+```{r}
+bm_P_SM_LS <- brm(data = data, data2 = list(A = A), family = gaussian(), 
+                  Persistence.log ~ SM.log + LS +
+                    (1|species_TPL) + (1|gr(species_TPL_phylo, cov = A)), 
+                  control = list(adapt_delta = 0.99), iter = 5000, cores = 4, chains = 4)
+Ftable(bm_P_SM_LS)
+
+#-- Model selection
+r2_bayes(bm_P_LS); r2_bayes(bm_P_SM_LS)
+loo(bm_P_LS, bm_P_SM_LS)
+```
+
+<br>
+
+* Persistence.log ~ SM.log + MP
+```{r}
+bm_P_SM_MP <- brm(data = data, data2 = list(A = A), family = gaussian(), 
+               Persistence.log ~ SM.log + MP +
+                 (1|species_TPL) + (1|gr(species_TPL_phylo, cov = A)), 
+               control = list(adapt_delta = 0.99), iter = 5000, cores = 4, chains = 4)
+Ftable(bm_P_SM_MP)
+
+#-- Model selection
+r2_bayes(bm_P_MP); r2_bayes(bm_P_SM_MP)
+loo(bm_P_MP, bm_P_SM_MP)
+```
+
+<br>
+
+## Emergence.logit ~ SM.log (Overall)
+```{r}
+#-- Model
+bm_E_SM <- brm(data = data, data2 = list(A = A), family = gaussian(), 
+               Emergence.logit ~ SM.log + 
+                 (1|species_TPL) + (1|gr(species_TPL_phylo, cov = A)), 
+               control = list(adapt_delta = 0.99), iter = 5000, cores = 4, chains = 4)
+Ftable(bm_E_SM)
+
+#-- Plot
+ce = conditional_effects(bm_E_SM, prob = 0.95)
+
+plot_E_SM_bm_raw = ggplot(data, aes(x = SM.log, y = Emergence.logit)) +
+  geom_point(shape = 19, size = 2, alpha = 0.5, col = "grey50") + 
+  geom_line(data = ce$SM.log, aes(x = SM.log, y = estimate__), linewidth = 1, linetype = 1) +
+  geom_ribbon(data = ce$SM.log, aes(ymin = lower__, ymax = upper__), fill = "grey50", alpha = 0.25) +
+  xlab("Seed mass (mg) [log scale]") + ylab("Seedling emergence [logit scale]") +
+  scale_x_continuous(breaks = c(-2, -1, 0, 1, 2), labels = c("0.01", "0.1", "1", "10", "100")) + 
+  scale_y_continuous(breaks = c(logit(0.05), logit(0.20), logit(0.50), logit(0.80), logit(0.95), logit(0.99), logit(0.999)),
+                     labels = c("0.05", "0.20", "0.50", "0.80", "0.95", "0.99", "0.999")) +
+  theme_classic(base_size = 16) +
+  theme(axis.text = element_text(colour = "black"), axis.text.y = element_text(hjust = 0.5, angle = 90))
+
+plot_E_SM_bm_raw
+
+ggsave("Rmd/Emergence_SM_bm_raw.jpg", units = "in", width = 8, height = 6, dpi = 300)
+```
+
+<br>
+
+## Emergence.logit ~ SM.log (Within group)
+### Dormancy
+* ND
+```{r}
+bm_E_SM_ND <- brm(data = data_ND, data2 = list(A = A_ND), family = gaussian(), 
+                  Emergence.logit ~ SM.log + 
+                    (1|species_TPL) + (1|gr(species_TPL_phylo, cov = A)), 
+                  control = list(adapt_delta = 0.99), iter = 5000, cores = 4, chains = 4)
+Ftable(bm_E_SM_ND)    # Not significant
+```
+
+* MPD
+```{r}
+bm_E_SM_MPD <- brm(data = data_MPD, data2 = list(A = A_MPD), family = gaussian(), 
+                   Emergence.logit ~ SM.log + 
+                     (1|species_TPL) + (1|gr(species_TPL_phylo, cov = A)), 
+                   control = list(adapt_delta = 0.99), iter = 5000, cores = 4, chains = 4)
+Ftable(bm_E_SM_MPD)    # Significant
+```
+
+* PD
+```{r}
+bm_E_SM_PD <- brm(data = data_PD, data2 = list(A = A_PD), family = gaussian(), 
+                  Emergence.logit ~ SM.log + 
+                    (1|species_TPL) + (1|gr(species_TPL_phylo, cov = A)), 
+                  control = list(adapt_delta = 0.99), iter = 5000, cores = 4, chains = 4)
+Ftable(bm_E_SM_PD)    # Significant
+```
+
+* PY
+```{r}
+bm_E_SM_PY <- brm(data = data_PY, data2 = list(A = A_PY), family = gaussian(), 
+                  Emergence.logit ~ SM.log + 
+                    (1|species_TPL) + (1|gr(species_TPL_phylo, cov = A)), 
+                  control = list(adapt_delta = 0.99), iter = 5000, cores = 4, chains = 4)
+Ftable(bm_E_SM_PY)    # Not significant
+```
+
+<br>
+
+### LS
+* Annual
+```{r}
+bm_E_SM_Annual <- brm(data = data_Annual, data2 = list(A = A_Annual), family = gaussian(), 
+                      Emergence.logit ~ SM.log + 
+                        (1|species_TPL) + (1|gr(species_TPL_phylo, cov = A)), 
+                      control = list(adapt_delta = 0.99), iter = 5000, cores = 4, chains = 4)
+Ftable(bm_E_SM_Annual)    # Significant
+```
+
+* Perennial
+```{r}
+bm_E_SM_Perennial <- brm(data = data_Perennial, data2 = list(A = A_Perennial), family = gaussian(), 
+                         Emergence.logit ~ SM.log + 
+                           (1|species_TPL) + (1|gr(species_TPL_phylo, cov = A)), 
+                         control = list(adapt_delta = 0.99), iter = 5000, cores = 4, chains = 4)
+Ftable(bm_E_SM_Perennial)    # Significant
+```
+
+<br>
+
+### MP
+* Monocarpic
+```{r}
+bm_E_SM_Monocarpic <- brm(data = data_Monocarpic, data2 = list(A = A_Monocarpic), family = gaussian(), 
+                          Emergence.logit ~ SM.log + 
+                            (1|species_TPL) + (1|gr(species_TPL_phylo, cov = A)), 
+                          control = list(adapt_delta = 0.99), iter = 5000, cores = 4, chains = 4)
+Ftable(bm_E_SM_Monocarpic)    # Significant
+```
+
+* Polycarpic
+```{r}
+bm_E_SM_Polycarpic <- brm(data = data_Polycarpic, data2 = list(A = A_Polycarpic), family = gaussian(), 
+                          Emergence.logit ~ SM.log + 
+                            (1|species_TPL) + (1|gr(species_TPL_phylo, cov = A)), 
+                          control = list(adapt_delta = 0.99), iter = 5000, cores = 4, chains = 4)
+Ftable(bm_E_SM_Polycarpic)    # Significant
+```
+
+<br>
+
+### Combine
+```{r fig.width = 5, fig.height = 6.5}
+#-- Combine
+post_E_SM = posterior_samples(bm_E_SM) %>% as_tibble() %>% select(b_SM.log) %>% mutate(Group = "Overall", Subset = "Overall")
+post_E_SM_ND = posterior_samples(bm_E_SM_ND) %>% as_tibble() %>% select(b_SM.log) %>% mutate(Group = "Dormancy", Subset = "ND")
+post_E_SM_MPD = posterior_samples(bm_E_SM_MPD) %>% as_tibble() %>% select(b_SM.log) %>% mutate(Group = "Dormancy", Subset = "MPD")
+post_E_SM_PD = posterior_samples(bm_E_SM_PD) %>% as_tibble() %>% select(b_SM.log) %>% mutate(Group = "Dormancy", Subset = "PD")
+post_E_SM_PY = posterior_samples(bm_E_SM_PY) %>% as_tibble() %>% select(b_SM.log) %>% mutate(Group = "Dormancy", Subset = "PY")
+post_E_SM_Annual = posterior_samples(bm_E_SM_Annual) %>% as_tibble() %>% select(b_SM.log) %>% mutate(Group = "LS", Subset = "Annual")
+post_E_SM_Perennial = posterior_samples(bm_E_SM_Perennial) %>% as_tibble() %>% select(b_SM.log) %>% mutate(Group = "LS", Subset = "Perennial")
+post_E_SM_Monocarpic = posterior_samples(bm_E_SM_Monocarpic) %>% as_tibble() %>% select(b_SM.log) %>% mutate(Group = "MP", Subset = "Monocarpic")
+post_E_SM_Polycarpic = posterior_samples(bm_E_SM_Polycarpic) %>% as_tibble() %>% select(b_SM.log) %>% mutate(Group = "MP", Subset = "Polycarpic")
+
+post_E_SM_all = bind_rows(post_E_SM, 
+                          post_E_SM_ND, post_E_SM_MPD, post_E_SM_PD, post_E_SM_PY,
+                          post_E_SM_Annual, post_E_SM_Perennial,
+                          post_E_SM_Monocarpic, post_E_SM_Polycarpic)
+post_E_SM_all$Group = factor(post_E_SM_all$Group, levels = c("Overall", "Dormancy", "LS", "MP"))
+post_E_SM_all$Subset = factor(post_E_SM_all$Subset, levels = c("Overall", 
+                                                               "ND", "MPD", "PD", "PY", 
+                                                               "Annual", "Perennial",
+                                                               "Monocarpic", "Polycarpic"))
+
+# A better plot
+post_E_SM_all %>% 
+  #---- locations ----#
+  mutate(loc = as.numeric(Subset),
+         loc = ifelse(loc %in% 8:9, loc + 3, 
+                      ifelse(loc %in% 6:7, loc + 2, 
+                             ifelse(loc %in% 2:5, loc + 1, loc)))) %>% 
+  #---- plot ----#
+  ggplot(aes(x = b_SM.log, y = loc, fill = Group)) + 
+  scale_y_reverse(breaks = c(1, 3:6, 8:9, 11:12), labels = c("Overall", 
+                                                             "ND", "MPD", "PD", "PY", 
+                                                             "Annual", "Perennial",
+                                                             "Monocarpic", "Polycarpic")) +
+  stat_halfeyeh(.width = 0.95, interval_size = 1.5, point_size = 2, slab_alpha = 0.5) +
+  geom_vline(xintercept = 0, linetype = "dashed") + 
+  scale_fill_manual(values = c("grey50", brewer_pal(palette = "Set2")(3))) +
+  xlab("Slope") + ylab(NULL) +
+  theme_test(base_size = 16) +
+  theme(legend.position = "none") +
+  theme(axis.text = element_text(colour = "black"))
+
+ggsave("Rmd/Emergence_SM_bm_all.jpg", units = "in", width = 5, height = 6.5, dpi = 300)
+```
+
+<br>
+
+## Emergence.logit ~ SM.log (Additive)
+* Emergence.logit ~ SM.log + Dormancy
+```{r}
+bm_E_SM_D <- brm(data = data, data2 = list(A = A), family = gaussian(), 
+                 Emergence.logit ~ SM.log + Dormancy +
+                   (1|species_TPL) + (1|gr(species_TPL_phylo, cov = A)), 
+                 control = list(adapt_delta = 0.99), iter = 5000, cores = 4, chains = 4)
+Ftable(bm_E_SM_D)
+
+#-- Model selection
+r2_bayes(bm_E_D); r2_bayes(bm_E_SM_D)
+loo(bm_E_D, bm_E_SM_D)
+```
+
+<br>
+
+* Emergence.logit ~ SM.log + LS
+```{r}
+bm_E_SM_LS <- brm(data = data, data2 = list(A = A), family = gaussian(), 
+                  Emergence.logit ~ SM.log + LS +
+                    (1|species_TPL) + (1|gr(species_TPL_phylo, cov = A)), 
+                  control = list(adapt_delta = 0.99), iter = 5000, cores = 4, chains = 4)
+Ftable(bm_E_SM_LS)
+
+#-- Model selection
+r2_bayes(bm_E_LS); r2_bayes(bm_E_SM_LS)
+loo(bm_E_LS, bm_E_SM_LS)
+```
+
+<br>
+
+* Emergence.logit ~ SM.log + MP
+```{r}
+bm_E_SM_MP <- brm(data = data, data2 = list(A = A), family = gaussian(), 
+                  Emergence.logit ~ SM.log + MP +
+                    (1|species_TPL) + (1|gr(species_TPL_phylo, cov = A)), 
+                  control = list(adapt_delta = 0.99), iter = 5000, cores = 4, chains = 4)
+Ftable(bm_E_SM_MP)
+
+#-- Model selection
+r2_bayes(bm_E_MP); r2_bayes(bm_E_SM_MP)
+loo(bm_E_MP, bm_E_SM_MP)
+```
+
+<br>
+
+
+# Figure 3
+Combine (4 traits, 2 responses)
+```{r fig.width = 12, fig.height = 20}
+plot_grid(plot_P_D_bm_raw,   plot_E_D_bm_raw, 
+          plot_P_LS_bm_raw, plot_E_LS_bm_raw, 
+          plot_P_MP_bm_raw,   plot_E_MP_bm_raw, 
+          plot_P_SM_bm_raw,        plot_E_SM_bm_raw,
+          labels = "auto", label_size = 16, nrow = 4,
+          label_x = 0, label_y = 1, greedy = FALSE)
+
+ggsave("Rmd/Figure3_bm_raw_GOB.jpg", units = "in", width = 12, height = 20, dpi = 300)
+```
+
+<div class="tocify-extend-page" data-unique="tocify-extend-page" style="height: 0;"></div>
